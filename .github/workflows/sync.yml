@@ -1,0 +1,26 @@
+name: board-sync
+
+# Keeps https://github.com/orgs/aeread-org/projects/1 current from GitHub facts.
+# Deterministic rules only (see sync_board.py); no model calls.
+on:
+  schedule:
+    - cron: "17 * * * *"   # hourly
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: board-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sync the board
+        env:
+          GH_TOKEN: ${{ secrets.BOARD_TOKEN }}
+        run: python3 sync_board.py
