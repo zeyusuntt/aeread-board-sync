@@ -1,0 +1,16 @@
+name: heartbeat
+
+# Temporary diagnostic: does any schedule fire on this repository?
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}
+
+permissions: {}
+
+jobs:
+  beat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - run: echo "schedule fired at $(date -u +%FT%TZ)"
