@@ -12,7 +12,7 @@ What it does on every run:
 - prints a digest: items to triage, decisions waiting per person, red PRs, review requests.
 
 Provenance: the text field "Sync state" holds compact JSON of the Status / Waiting on values this script
-last wrote for the item. The script changes one of those only when the field is empty, when it still holds
+last wrote (and the write was confirmed) for the item. The script changes one of those only when the field is empty, when it still holds
 the value the script wrote, or (Status only) when it holds a machine-managed state. A closed item always
 goes to Done. It only rewrites "Blocked by" text that it wrote itself (prefix "auto:").
 
@@ -39,6 +39,12 @@ class GqlError(RuntimeError):
     pass
 
 
+class Partial(dict):
+    """Mutation data plus which aliases the response says failed (all of them when it cannot tell)."""
+    failed_all = False
+    failed_aliases = frozenset()
+
+
 def gql(query, allow_partial=False, **variables):
     """Run one GraphQL call through gh. Raises GqlError on any transport or GraphQL error.
 
@@ -55,8 +61,9 @@ def gql(query, allow_partial=False, **variables):
     if not isinstance(out, dict):
         raise GqlError(f"gh exit {proc.returncode}, unparsable output: {(proc.stderr or proc.stdout)[:200]!r}")
     errors = out.get("errors")
+    messages = ""
     if errors:
-        messages = "; ".join(str(e.get("message", e))[:200] for e in errors)
+        messages = "; ".join(str(e.get("message", e))[:200] if isinstance(e, dict) else str(e)[:200] for e in errors)
         if not allow_partial:
             raise GqlError(f"GraphQL errors: {messages}")
         print("GRAPHQL ERROR:", messages)
@@ -65,9 +72,22 @@ def gql(query, allow_partial=False, **variables):
         raise GqlError(f"gh exit {proc.returncode}: {(proc.stderr or out.get('message', ''))[:200]!r}")
     if data is None:
         if allow_partial:
-            return {}
+            return Partial()
         raise GqlError("response has no data")
-    return data
+    if not allow_partial:
+        return data
+    result = Partial(data)
+    failed = set()
+    for err in errors or []:
+        path = err.get("path") if isinstance(err, dict) else None
+        if isinstance(path, list) and path and isinstance(path[0], str):
+            failed.add(path[0])
+        else:
+            result.failed_all = True
+    if proc.returncode != 0 and not errors:
+        result.failed_all = True
+    result.failed_aliases = frozenset(failed)
+    return result
 
 
 ITEMS = """query($org:String!, $num:Int!, $after:String){ organization(login:$org){ projectV2(number:$num){
@@ -144,7 +164,7 @@ def ci_state(pr):
     contexts = rollup["contexts"]
     if (contexts.get("pageInfo") or {}).get("hasNextPage"):
         return "unknown", []
-    latest = {}
+    runs = {}
     for check in contexts["nodes"]:
         name = check.get("name") or check.get("context")
         if not name or name in APPROVAL_GATES:
@@ -155,12 +175,21 @@ def ci_state(pr):
             red = check.get("conclusion") in RED_CONCLUSIONS
             wait = check.get("conclusion") is None
             stamp = check.get("completedAt") or check.get("startedAt") or ""
-        if name not in latest or stamp >= latest[name][0]:
-            latest[name] = (stamp, red, wait)
-    red_names = sorted(n for n, (_, red, _) in latest.items() if red)
+        runs.setdefault(name, []).append((stamp, red, wait))
+    red_names, unknown = [], False
+    for name, group in runs.items():
+        if any(wait for _, _, wait in group):
+            unknown = True
+            continue
+        top = max(stamp for stamp, _, _ in group)
+        if len({red for stamp, red, _ in group if stamp == top}) > 1 or (len(group) > 1 and not top):
+            unknown = True          # cannot tell which run is the latest
+        elif any(red for stamp, red, _ in group if stamp == top):
+            red_names.append(name)
+    red_names.sort()
     if red_names:
         return "red", red_names
-    if any(wait for _, _, wait in latest.values()):
+    if unknown:
         return "unknown", []
     return "ok", []
 
@@ -191,20 +220,19 @@ def desired(item, current, state):
             if owned("Status", current, state):
                 want["Status"] = "In progress" if content["isDraft"] else "In review"
             author = (content.get("author") or {}).get("login")
-            if author is not None:
-                reviewers = [n["requestedReviewer"]["login"] for n in content["reviewRequests"]["nodes"]
-                             if n.get("requestedReviewer")]
-                waiting = [PEOPLE[r] for r in reviewers if r in PEOPLE]
-                target = None
-                if waiting:
-                    target = waiting[0]
-                elif content["reviewDecision"] == "CHANGES_REQUESTED" and author in PEOPLE:
-                    target = PEOPLE[author]
-                if target is not None:
-                    if owned("Waiting on", current, state):
-                        want["Waiting on"] = target
-                elif own_waiting:
-                    want["Waiting on"] = None
+            reviewers = [n["requestedReviewer"]["login"] for n in content["reviewRequests"]["nodes"]
+                         if n.get("requestedReviewer")]
+            waiting = [PEOPLE[r] for r in reviewers if r in PEOPLE]
+            target = None
+            if waiting:
+                target = waiting[0]
+            elif content["reviewDecision"] == "CHANGES_REQUESTED" and author in PEOPLE:
+                target = PEOPLE[author]
+            if target is not None:
+                if owned("Waiting on", current, state):
+                    want["Waiting on"] = target
+            elif own_waiting:
+                want["Waiting on"] = None
             verdict, red = ci_state(content)
             if verdict == "red":
                 auto_blocked = "auto: CI red: " + ", ".join(red)[:100]
@@ -250,28 +278,85 @@ def encode_state(state):
 
 
 def run_batches(groups, failures):
-    """groups: list of (label, [mutation, ...]); an item's mutations always share one batch."""
+    """groups: list of (label, [mutation, ...]); an item's mutations always share one batch.
+
+    Returns one list of booleans per group: True where that mutation was confirmed written.
+    """
     batches, cur, size = [], [], 0
-    for group in groups:
+    for idx, group in enumerate(groups):
         if cur and size + len(group[1]) > BATCH:
             batches.append(cur)
             cur, size = [], 0
-        cur.append(group)
+        cur.append((idx, group))
         size += len(group[1])
     if cur:
         batches.append(cur)
+    ok = [[False] * len(g[1]) for g in groups]
     for batch in batches:
-        flat = [(label, m) for label, muts in batch for m in muts]
-        query = "mutation{ " + " ".join(f"e{k}: {m}" for k, (_, m) in enumerate(flat)) + " }"
+        flat = [(idx, pos, group[0], m) for idx, group in batch for pos, m in enumerate(group[1])]
+        query = "mutation{ " + " ".join(f"e{k}: {f[3]}" for k, f in enumerate(flat)) + " }"
         try:
             data = gql(query, allow_partial=True)
         except GqlError as exc:
-            for label, _ in flat:
+            for _, _, label, _ in flat:
                 failures.append(f"{label}: {exc}")
             continue
-        for k, (label, _) in enumerate(flat):
-            if data.get(f"e{k}") is None:
+        failed_all = getattr(data, "failed_all", False)
+        failed_aliases = getattr(data, "failed_aliases", frozenset())
+        for k, (idx, pos, label, _) in enumerate(flat):
+            alias = f"e{k}"
+            if failed_all:
+                failures.append(f"{label}: batch reported errors")
+            elif alias in failed_aliases:
+                failures.append(f"{label}: write reported a GraphQL error")
+            elif data.get(alias) is None:
                 failures.append(f"{label}: write returned null")
+            else:
+                ok[idx][pos] = True
+    return ok
+
+
+def write_entries(project_id, fields, entries, failures, has_state):
+    """entries: list of (label, item_id, [(field, value)], prior_state). Values first, then Sync state.
+
+    Sync state records only the Status / Waiting on writes that were confirmed.
+    """
+    groups, built = [], []
+    for label, item_id, edits, _ in entries:
+        muts, kept = [], []
+        for name, value in edits:
+            try:
+                muts.append(set_value(project_id, fields, item_id, name, value))
+            except GqlError as exc:
+                failures.append(f"{label}: {exc}")
+                continue
+            kept.append((name, value))
+        built.append(kept)
+        groups.append((label, muts))
+    live = [(i, g) for i, g in enumerate(groups) if g[1]]
+    results = run_batches([g for _, g in live], failures) if live else []
+    confirmed = {i: res for (i, _), res in zip(live, results)}
+    state_groups = []
+    for i, (label, item_id, _, prior) in enumerate(entries):
+        if not has_state:
+            continue
+        new_state = dict(prior)
+        for (name, value), ok in zip(built[i], confirmed.get(i, [])):
+            if ok and name in STATE_KEYS:
+                if value is None:
+                    new_state.pop(name, None)
+                else:
+                    new_state[name] = value
+        if new_state == prior:
+            continue
+        try:
+            state_groups.append((f"{label} (Sync state)",
+                                 [set_value(project_id, fields, item_id, STATE_FIELD, encode_state(new_state))]))
+        except GqlError as exc:
+            failures.append(f"{label}: {exc}")
+    if state_groups:
+        run_batches(state_groups, failures)
+    return confirmed
 
 
 def main():
@@ -299,10 +384,8 @@ def main():
             item_id = ((data.get("addProjectV2ItemById") or {}).get("item") or {}).get("id")
             if not item_id:
                 raise GqlError("add returned no item")
-            muts = [set_value(project_id, fields, item_id, "Status", "Triage")]
-            if has_state:
-                muts.append(set_value(project_id, fields, item_id, STATE_FIELD, encode_state({"Status": "Triage"})))
-            run_batches([(f"add #{node['number']}", muts)], failures)
+            write_entries(project_id, fields, [(f"add #{node['number']}", item_id, [("Status", "Triage")], {})],
+                          failures, has_state)
             added += 1
         except GqlError as exc:
             failures.append(f"add #{node['number']}: {exc}")
@@ -310,7 +393,7 @@ def main():
         project_id, fields, items = load_project()
         has_state = STATE_FIELD in fields
 
-    groups, nedits = [], 0
+    entries, nedits = [], 0
     digest = {"triage": [], "decisions": {}, "red": [], "review": {}}
     for item in items:
         content = item.get("content")
@@ -319,25 +402,14 @@ def main():
         current = values(item)
         state = parse_state(current.get(STATE_FIELD)) if has_state else {}
         label = ("PR#" if content["__typename"] == "PullRequest" else "#") + str(content["number"])
-        new_state, muts = dict(state), []
+        edits = []
         for field_name, value in desired(item, current, state).items():
             print(f"{label}: {field_name}: {current.get(field_name)!r} -> {value!r}")
-            try:
-                muts.append(set_value(project_id, fields, item["id"], field_name, value))
-            except GqlError as exc:
-                failures.append(f"{label}: {exc}")
-                continue
-            if field_name in STATE_KEYS:
-                if value is None:
-                    new_state.pop(field_name, None)
-                else:
-                    new_state[field_name] = value
+            edits.append((field_name, value))
             current[field_name] = value
-        if muts and has_state and new_state != state:
-            muts.append(set_value(project_id, fields, item["id"], STATE_FIELD, encode_state(new_state)))
-        if muts:
-            nedits += len(muts)
-            groups.append((label, muts))
+        if edits:
+            nedits += len(edits)
+            entries.append((label, item["id"], edits, state))
         if content.get("state") == "OPEN":
             if current.get("Status") == "Triage":
                 digest["triage"].append(label)
@@ -347,8 +419,8 @@ def main():
                 digest["red"].append(label)
             if content["__typename"] == "PullRequest" and current.get("Status") == "In review" and current.get("Waiting on"):
                 digest["review"].setdefault(current["Waiting on"], []).append(label)
-    if groups and not DRY:
-        run_batches(groups, failures)
+    if entries and not DRY:
+        write_entries(project_id, fields, entries, failures, has_state)
 
     lines = [f"{added} added, {nedits} field updates{' (dry run)' if DRY else ''}",
              "To triage: " + (", ".join(digest["triage"]) or "none")]

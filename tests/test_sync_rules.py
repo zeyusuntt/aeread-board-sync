@@ -275,13 +275,15 @@ def test_dry_run_does_not_create_field_or_write(run):
     assert w.created_fields == 0 and not w.mutation_queries
 
 
-def test_sync_state_written_in_same_batch_as_values(run):
+def test_sync_state_written_after_values(run):
     w = World()
     w.add(pr(1, reviewers=["LEE-CHENYU"]), Status="Triage")
     run(w)
-    assert len(w.mutation_queries) == 1
-    q = w.mutation_queries[0]
-    assert "F_status" in q and "F_wait" in q and "F_sync" in q
+    assert len(w.mutation_queries) == 2
+    first, second = w.mutation_queries
+    assert "F_status" in first and "F_wait" in first and "F_sync" not in first
+    assert "F_sync" in second and "F_status" not in second
+    assert state(w, "PR_1") == {"Status": "In review", "Waiting on": "Chenyu"}
 
 
 def test_waiting_cleared_when_request_gone_and_value_is_own(run):
@@ -514,12 +516,34 @@ def test_null_author_with_changes_requested_does_not_crash(run):
     assert not w.vals("PR_1").get("Waiting on")
 
 
-def test_null_author_leaves_existing_waiting_unchanged(run):
+def test_null_author_changes_requested_clears_own_stale_waiting(run):
     w = World()
     w.add(pr(1, author=None, decision="CHANGES_REQUESTED"), Status="In review",
           **{"Waiting on": "Zeyu", "Sync state": '{"Waiting on":"Zeyu"}'})
     assert run(w) == 0
+    assert not w.vals("PR_1").get("Waiting on")
+
+
+def test_null_author_keeps_person_set_waiting(run):
+    w = World()
+    w.add(pr(1, author=None, decision="CHANGES_REQUESTED"), Status="In review", **{"Waiting on": "Zeyu"})
+    assert run(w) == 0
     assert w.vals("PR_1")["Waiting on"] == "Zeyu"
+
+
+def test_null_author_still_fills_waiting_from_review_request(run):
+    w = World()
+    w.add(pr(1, author=None, reviewers=["LEE-CHENYU"]), Status="In review")
+    assert run(w) == 0
+    assert w.vals("PR_1")["Waiting on"] == "Chenyu"
+
+
+def test_null_author_clears_own_waiting_when_request_gone(run):
+    w = World()
+    w.add(pr(1, author=None), Status="In review",
+          **{"Waiting on": "Chenyu", "Sync state": '{"Waiting on":"Chenyu"}'})
+    assert run(w) == 0
+    assert not w.vals("PR_1").get("Waiting on")
 
 
 def test_changes_requested_waits_on_author(run):
@@ -533,3 +557,104 @@ def test_changes_requested_waits_on_author(run):
 def test_graphql_documents_have_balanced_braces(name):
     q = getattr(sync, name)
     assert q.count("{") == q.count("}") and q.count("(") == q.count(")")
+
+
+# ---- 7. round two: state provenance, batch errors, CI ordering ------------------------------
+
+def test_failed_value_write_leaves_sync_state_unchanged(run):
+    w = World()
+    w.add(pr(1, reviewers=["LEE-CHENYU"]), Status="Triage")
+    w.fail = lambda item_id, field: field == "Waiting on"
+    assert run(w) == 1
+    assert w.vals("PR_1")["Status"] == "In review"
+    assert not w.vals("PR_1").get("Waiting on")
+    assert state(w, "PR_1") == {"Status": "In review"}          # only the confirmed field
+
+
+def test_all_value_writes_failed_writes_no_state(run):
+    w = World()
+    w.add(pr(1, reviewers=["LEE-CHENYU"]), Status="Triage")
+    w.fail = lambda item_id, field: field != "Sync state"
+    assert run(w) == 1
+    assert not w.vals("PR_1").get("Sync state")
+
+
+def test_state_write_failure_is_reported(run, capsys):
+    w = World()
+    w.add(pr(1), Status="Triage")
+    w.fail = lambda item_id, field: field == "Sync state"
+    assert run(w) == 1
+    assert "Sync state" in capsys.readouterr().out
+
+
+def test_successful_write_then_next_run_treats_value_as_own(run):
+    w = World()
+    w.add(pr(1, reviewers=["LEE-CHENYU"]), Status="Triage")
+    assert run(w) == 0
+    w.contents["PR_1"]["reviewRequests"] = {"nodes": [{"requestedReviewer": {"login": "ychenfang"}}]}
+    assert run(w) == 0
+    assert w.vals("PR_1")["Waiting on"] == "Yuchen"
+
+
+@pytest.fixture
+def raw_gh(monkeypatch, run):
+    """Mutations go through the real sync.gql with a faked gh process; reads use the fake board."""
+    def install(w, errors=None, code=0):
+        real = sync.gql
+
+        def gql(query, allow_partial=False, **kw):
+            if query.startswith("mutation{ e"):
+                out = w.gql(query, allow_partial=allow_partial, **kw)
+                body = {"data": out}
+                if errors:
+                    body["errors"] = errors
+                fake_run(monkeypatch, json.dumps(body), code=code)
+                return real(query, allow_partial=allow_partial, **kw)
+            return w.gql(query, allow_partial=allow_partial, **kw)
+        monkeypatch.setattr(sync, "gql", gql)
+        monkeypatch.setattr(sync, "DRY", False)
+        return sync.main()
+    return install
+
+
+def test_subfield_graphql_error_on_nonnull_alias_fails_the_alias(raw_gh, capsys):
+    w = World()
+    w.add(pr(1, reviewers=["LEE-CHENYU"]), Status="Triage")
+    code = raw_gh(w, errors=[{"message": "denied", "path": ["e1", "clientMutationId"]}], code=1)
+    assert code == 1
+    assert "FAIL" in capsys.readouterr().out
+    assert not state(w, "PR_1").get("Waiting on")
+
+
+def test_nonzero_exit_without_errors_fails_all_aliases(raw_gh, capsys):
+    w = World()
+    w.add(pr(1), Status="Triage")
+    assert raw_gh(w, errors=None, code=1) == 1
+    assert "FAIL" in capsys.readouterr().out
+
+
+def test_pathless_graphql_error_fails_whole_batch(raw_gh):
+    w = World()
+    w.add(pr(1), Status="Triage")
+    assert raw_gh(w, errors=[{"message": "rate limited"}], code=0) == 1
+
+
+def test_ci_old_success_plus_newer_queued_with_null_times_is_unknown():
+    queued = {"name": "test", "conclusion": None, "status": "QUEUED", "startedAt": None, "completedAt": None}
+    verdict, _ = sync.ci_state(pr(1, checks=[check("test"), queued]))
+    assert verdict == "unknown"
+
+
+def test_ci_competing_runs_with_null_times_is_unknown():
+    a = check("test", "SUCCESS", completed=None, started=None)
+    b = check("test", "FAILURE", completed=None, started=None)
+    verdict, _ = sync.ci_state(pr(1, checks=[a, b]))
+    assert verdict == "unknown"
+
+
+def test_ci_queued_run_keeps_existing_blocker(run):
+    w = World()
+    queued = {"name": "test", "conclusion": None, "status": "QUEUED", "startedAt": None, "completedAt": None}
+    w.add(pr(1, checks=[check("test"), queued]), Status="In review", **{"Blocked by": "auto: CI red: test"})
+    assert run(w) == 0
+    assert w.vals("PR_1")["Blocked by"] == "auto: CI red: test"
