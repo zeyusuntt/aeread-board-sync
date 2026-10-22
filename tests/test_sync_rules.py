@@ -527,3 +527,9 @@ def test_changes_requested_waits_on_author(run):
     w.add(pr(1, decision="CHANGES_REQUESTED"), Status="In review")
     run(w)
     assert w.vals("PR_1")["Waiting on"] == "Zeyu"
+
+
+@pytest.mark.parametrize("name", ["ITEMS", "OPEN_ISSUES", "OPEN_PRS"])
+def test_graphql_documents_have_balanced_braces(name):
+    q = getattr(sync, name)
+    assert q.count("{") == q.count("}") and q.count("(") == q.count(")")

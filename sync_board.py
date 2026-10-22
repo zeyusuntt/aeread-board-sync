@@ -82,7 +82,7 @@ ITEMS = """query($org:String!, $num:Int!, $after:String){ organization(login:$or
       ... on PullRequest{ id number state isDraft merged reviewDecision author{ login } repository{ nameWithOwner }
         reviewRequests(first:10){ nodes{ requestedReviewer{ ... on User{ login } } } }
         commits(last:1){ nodes{ commit{ statusCheckRollup{ contexts(first:100){ pageInfo{ hasNextPage } nodes{
-          ... on CheckRun{ name conclusion status startedAt completedAt } ... on StatusContext{ context state } } } } } } } } } } } } }"""
+          ... on CheckRun{ name conclusion status startedAt completedAt } ... on StatusContext{ context state } } } } } } } } } } } } } }"""
 
 OPEN_ISSUES = """query($owner:String!, $name:String!, $after:String){ repository(owner:$owner, name:$name){
   issues(states:OPEN, first:100, after:$after){ pageInfo{ hasNextPage endCursor } nodes{ id number } } } }"""
