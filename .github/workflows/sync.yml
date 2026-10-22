@@ -4,7 +4,7 @@ name: board-sync
 # Deterministic rules only (see sync_board.py); no model calls.
 on:
   schedule:
-    - cron: "17 * * * *"   # hourly
+    - cron: "17 * * * *"   # hourly, at minute 17 (GitHub may delay scheduled runs)
   workflow_dispatch: {}
 
 permissions:
