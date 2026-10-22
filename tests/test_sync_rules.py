@@ -658,3 +658,35 @@ def test_ci_queued_run_keeps_existing_blocker(run):
     w.add(pr(1, checks=[check("test"), queued]), Status="In review", **{"Blocked by": "auto: CI red: test"})
     assert run(w) == 0
     assert w.vals("PR_1")["Blocked by"] == "auto: CI red: test"
+
+
+# ---- third review round ---------------------------------------------------------------------
+
+def _two_aliases(monkeypatch, errors, code):
+    body = {"data": {"e0": {"clientMutationId": None}, "e1": {"clientMutationId": None}}}
+    if errors:
+        body["errors"] = errors
+    fake_run(monkeypatch, json.dumps(body), code=code)
+    failures = []
+    ok = sync.run_batches([("A", ["m0"]), ("B", ["m1"])], failures)
+    return ok, failures
+
+
+@pytest.mark.parametrize("code", [0, 1])
+def test_alias_error_fails_only_that_alias(monkeypatch, code):
+    ok, failures = _two_aliases(monkeypatch, [{"message": "denied", "path": ["e1", "clientMutationId"]}], code)
+    assert ok == [[True], [False]]
+    assert len(failures) == 1 and failures[0].startswith("B:")
+
+
+def test_error_path_outside_the_batch_fails_the_whole_batch(monkeypatch):
+    ok, failures = _two_aliases(monkeypatch, [{"message": "odd", "path": ["e999", "clientMutationId"]}], 0)
+    assert ok == [[False], [False]]
+    assert len(failures) == 2
+
+
+def test_ci_competing_runs_with_one_missing_timestamp_is_unknown():
+    a = check("test", "SUCCESS")
+    b = check("test", "FAILURE", completed=None, started=None)
+    verdict, _ = sync.ci_state(pr(1, checks=[a, b]))
+    assert verdict == "unknown"

@@ -182,7 +182,8 @@ def ci_state(pr):
             unknown = True
             continue
         top = max(stamp for stamp, _, _ in group)
-        if len({red for stamp, red, _ in group if stamp == top}) > 1 or (len(group) > 1 and not top):
+        if len({red for stamp, red, _ in group if stamp == top}) > 1 or (
+                len(group) > 1 and any(not stamp for stamp, _, _ in group)):
             unknown = True          # cannot tell which run is the latest
         elif any(red for stamp, red, _ in group if stamp == top):
             red_names.append(name)
@@ -303,6 +304,9 @@ def run_batches(groups, failures):
             continue
         failed_all = getattr(data, "failed_all", False)
         failed_aliases = getattr(data, "failed_aliases", frozenset())
+        if failed_aliases - {f"e{k}" for k in range(len(flat))}:
+            failed_all = True       # an error we cannot attribute to this batch's writes
+
         for k, (idx, pos, label, _) in enumerate(flat):
             alias = f"e{k}"
             if failed_all:
